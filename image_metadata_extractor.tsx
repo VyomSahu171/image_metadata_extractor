@@ -1,4 +1,4 @@
-'use client';
+'use client'
 import React, { useState, useRef, useCallback, DragEvent, ChangeEvent } from 'react';
 
 // TypeScript interfaces
@@ -10,7 +10,7 @@ interface ImageMetadata {
   iptc: Record<string, any>;
   xmp: Record<string, any>;
   processedAt: Date;
-  id: string; // Added unique identifier for React keys
+  id: string;
 }
 
 interface TestResult {
@@ -52,6 +52,33 @@ const METADATA_ICONS: Record<string, string> = {
 const XMP_TITLE_REGEX = /<dc:title[^>]*>([^<]+)<\/dc:title>/i;
 const XMP_CREATOR_REGEX = /<dc:creator[^>]*>([^<]+)<\/dc:creator>/i;
 
+// CSV headers as constant to reduce complexity
+const CSV_HEADERS = [
+  'filename', 'fileSize', 'mimeType', 'processedAt',
+  'exif_make', 'exif_model', 'exif_dateTime', 'exif_orientation',
+  'iptc_detected', 'xmp_detected', 'xmp_title', 'xmp_creator'
+];
+
+// Test definitions moved outside to reduce complexity
+const TEST_DEFINITIONS = [
+  {
+    name: 'File size formatting',
+    test: (formatFileSize: (bytes: number) => string) => formatFileSize(1024) === '1 KB'
+  },
+  {
+    name: 'CSV escaping',
+    test: (escapeCsvValue: (value: any) => string) => escapeCsvValue('test,value') === '"test,value"'
+  },
+  {
+    name: 'Supported MIME types',
+    test: (supportedMimeTypes: Set<string>) => supportedMimeTypes.has('image/jpeg')
+  },
+  {
+    name: 'Type sizes',
+    test: () => getTypeSize(3) === 2
+  }
+];
+
 // Styles object with fixed duplicate padding issue
 const styles = {
   container: {
@@ -60,7 +87,7 @@ const styles = {
     fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
     background: '#f8f9fa',
     minHeight: '100vh',
-    padding: '20px', // Single padding declaration
+    padding: '20px',
   },
   metadataExtractor: {
     maxWidth: '1200px',
@@ -90,15 +117,20 @@ const styles = {
   content: {
     padding: '30px',
   },
+  uploadZoneContainer: {
+    marginBottom: '30px',
+  },
   uploadZone: {
     border: '3px dashed #007bff',
     borderRadius: '12px',
     padding: '50px',
     textAlign: 'center' as const,
-    marginBottom: '30px',
     transition: 'all 0.3s ease',
     cursor: 'pointer',
     background: '#f8f9ff',
+    width: '100%',
+    fontSize: 'inherit',
+    fontFamily: 'inherit',
   },
   uploadZoneHover: {
     borderColor: '#0056b3',
@@ -260,7 +292,8 @@ const styles = {
 // Helper functions to reduce cognitive complexity
 const getTypeSize = (type: number): number => TYPE_SIZES[type] || 1;
 
-const generateUniqueId = (): string => `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+// Fixed: Replace deprecated substr() with slice()
+const generateUniqueId = (): string => `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
 
 const getTagValue = (
   dataView: DataView, 
@@ -314,6 +347,36 @@ const getTagValue = (
   }
 };
 
+// Separate function to process individual IFD entry
+const processIfdEntry = (
+  dataView: DataView,
+  tagOffset: number,
+  tiffOffset: number,
+  isBigEndian: boolean,
+  exifData: Record<string, any>
+) => {
+  const tag = isBigEndian ? 
+    dataView.getUint16(tagOffset) : 
+    dataView.getUint16(tagOffset, true);
+  
+  const type = isBigEndian ? 
+    dataView.getUint16(tagOffset + 2) : 
+    dataView.getUint16(tagOffset + 2, true);
+    
+  const count = isBigEndian ? 
+    dataView.getUint32(tagOffset + 4) : 
+    dataView.getUint32(tagOffset + 4, true);
+
+  if (EXIF_TAGS[tag]) {
+    try {
+      const value = getTagValue(dataView, tagOffset + 8, type, count, tiffOffset, isBigEndian);
+      exifData[EXIF_TAGS[tag]] = value;
+    } catch (error) {
+      console.warn(`Error reading tag ${EXIF_TAGS[tag]}:`, error);
+    }
+  }
+};
+
 const parseIfd = (
   dataView: DataView, 
   ifdOffset: number, 
@@ -327,53 +390,42 @@ const parseIfd = (
 
   for (let i = 0; i < Math.min(tagCount, 50); i++) {
     const tagOffset = ifdOffset + 2 + (i * 12);
-    const tag = isBigEndian ? 
-      dataView.getUint16(tagOffset) : 
-      dataView.getUint16(tagOffset, true);
-    
-    const type = isBigEndian ? 
-      dataView.getUint16(tagOffset + 2) : 
-      dataView.getUint16(tagOffset + 2, true);
-      
-    const count = isBigEndian ? 
-      dataView.getUint32(tagOffset + 4) : 
-      dataView.getUint32(tagOffset + 4, true);
+    processIfdEntry(dataView, tagOffset, tiffOffset, isBigEndian, exifData);
+  }
+};
 
-    if (EXIF_TAGS[tag]) {
-      try {
-        const value = getTagValue(dataView, tagOffset + 8, type, count, tiffOffset, isBigEndian);
-        exifData[EXIF_TAGS[tag]] = value;
-      } catch (error) {
-        console.warn(`Error reading tag ${EXIF_TAGS[tag]}:`, error);
+// Separate function to find EXIF marker
+const findExifMarker = (dataView: DataView): number => {
+  for (let i = 0; i < dataView.byteLength - 1; i++) {
+    if (dataView.getUint8(i) === 0xFF && dataView.getUint8(i + 1) === 0xE1) {
+      const exifHeaderOffset = i + 4;
+      
+      if (dataView.getUint32(exifHeaderOffset) === 0x45786966 && 
+          dataView.getUint16(exifHeaderOffset + 4) === 0x0000) {
+        return exifHeaderOffset;
       }
     }
   }
+  return -1;
 };
 
 const extractExifData = (dataView: DataView): Record<string, any> => {
   const exifData: Record<string, any> = {};
   
   try {
-    for (let i = 0; i < dataView.byteLength - 1; i++) {
-      if (dataView.getUint8(i) === 0xFF && dataView.getUint8(i + 1) === 0xE1) {
-        const exifHeaderOffset = i + 4; // Removed unused segmentLength assignment
-        
-        if (dataView.getUint32(exifHeaderOffset) === 0x45786966 && 
-            dataView.getUint16(exifHeaderOffset + 4) === 0x0000) {
-          
-          const tiffOffset = exifHeaderOffset + 6;
-          const isBigEndian = dataView.getUint16(tiffOffset) === 0x4D4D;
-          
-          exifData.byteOrder = isBigEndian ? 'Big Endian' : 'Little Endian';
-          
-          const ifd0Offset = tiffOffset + (isBigEndian ? 
-            dataView.getUint32(tiffOffset + 4) : 
-            dataView.getUint32(tiffOffset + 4, true));
-          
-          parseIfd(dataView, ifd0Offset, tiffOffset, isBigEndian, exifData);
-        }
-        break;
-      }
+    const exifHeaderOffset = findExifMarker(dataView);
+    
+    if (exifHeaderOffset !== -1) {
+      const tiffOffset = exifHeaderOffset + 6;
+      const isBigEndian = dataView.getUint16(tiffOffset) === 0x4D4D;
+      
+      exifData.byteOrder = isBigEndian ? 'Big Endian' : 'Little Endian';
+      
+      const ifd0Offset = tiffOffset + (isBigEndian ? 
+        dataView.getUint32(tiffOffset + 4) : 
+        dataView.getUint32(tiffOffset + 4, true));
+      
+      parseIfd(dataView, ifd0Offset, tiffOffset, isBigEndian, exifData);
     }
   } catch (error) {
     console.warn('Error extracting EXIF data:', error);
@@ -396,7 +448,6 @@ const findIptcMarkers = (dataView: DataView): boolean => {
 const extractXmpMetadata = (xmpContent: string): Record<string, any> => {
   const xmpData: Record<string, any> = {};
   
-  // Use RegExp.exec() instead of string.match()
   const titleMatch = XMP_TITLE_REGEX.exec(xmpContent);
   if (titleMatch) {
     xmpData.title = titleMatch[1];
@@ -409,6 +460,57 @@ const extractXmpMetadata = (xmpContent: string): Record<string, any> => {
   
   return xmpData;
 };
+
+// Separate function to process XMP packet
+const processXmpPacket = (fileString: string): Record<string, any> => {
+  const xmpData: Record<string, any> = {};
+  const xmpStart = fileString.indexOf('<?xpacket begin=');
+  const xmpEnd = fileString.indexOf('<?xpacket end=');
+  
+  if (xmpStart !== -1 && xmpEnd !== -1) {
+    const xmpContent = fileString.substring(xmpStart, xmpEnd + 20);
+    const truncatedContent = xmpContent.substring(0, 500);
+    xmpData.rawXMP = truncatedContent + '...';
+    xmpData.detected = true;
+    
+    const extractedMetadata = extractXmpMetadata(xmpContent);
+    Object.assign(xmpData, extractedMetadata);
+  } else {
+    xmpData.detected = false;
+    xmpData.note = 'No XMP packet found in image';
+  }
+  
+  return xmpData;
+};
+
+// Separate function to convert buffer to string
+const convertBufferToString = (arrayBuffer: ArrayBuffer): string => {
+  const uint8Array = new Uint8Array(arrayBuffer);
+  let fileString = '';
+  
+  const searchLength = Math.min(arrayBuffer.byteLength, 65536);
+  for (let i = 0; i < searchLength; i++) {
+    fileString += String.fromCharCode(uint8Array[i]);
+  }
+  
+  return fileString;
+};
+
+// Create row data for CSV export
+const createCsvRow = (metadata: ImageMetadata, escapeCsvValue: (value: any) => string): any[] => [
+  escapeCsvValue(metadata.filename),
+  metadata.fileSize,
+  escapeCsvValue(metadata.mimeType),
+  metadata.processedAt.toISOString(),
+  escapeCsvValue(metadata.exif.Make || ''),
+  escapeCsvValue(metadata.exif.Model || ''),
+  escapeCsvValue(metadata.exif.DateTime || ''),
+  metadata.exif.Orientation || '',
+  metadata.iptc.detected || false,
+  metadata.xmp.detected || false,
+  escapeCsvValue(metadata.xmp.title || ''),
+  escapeCsvValue(metadata.xmp.creator || '')
+];
 
 const ImageMetadataExtractor: React.FC = () => {
   // State management
@@ -480,31 +582,9 @@ const ImageMetadataExtractor: React.FC = () => {
     const xmpData: Record<string, any> = {};
     
     try {
-      const uint8Array = new Uint8Array(arrayBuffer);
-      let fileString = '';
-      
-      const searchLength = Math.min(arrayBuffer.byteLength, 65536);
-      for (let i = 0; i < searchLength; i++) {
-        fileString += String.fromCharCode(uint8Array[i]);
-      }
-      
-      const xmpStart = fileString.indexOf('<?xpacket begin=');
-      const xmpEnd = fileString.indexOf('<?xpacket end=');
-      
-      if (xmpStart !== -1 && xmpEnd !== -1) {
-        const xmpContent = fileString.substring(xmpStart, xmpEnd + 20);
-        xmpData.rawXMP = xmpContent.substring(0, 500) + '...';
-        xmpData.detected = true;
-        
-        // Extract metadata using helper function
-        const extractedMetadata = extractXmpMetadata(xmpContent);
-        Object.assign(xmpData, extractedMetadata);
-        
-      } else {
-        xmpData.detected = false;
-        xmpData.note = 'No XMP packet found in image';
-      }
-      
+      const fileString = convertBufferToString(arrayBuffer);
+      const processedXmpData = processXmpPacket(fileString);
+      Object.assign(xmpData, processedXmpData);
     } catch (error) {
       console.warn('Error extracting XMP data:', error);
       xmpData.error = 'Failed to parse XMP data';
@@ -555,6 +635,45 @@ const ImageMetadataExtractor: React.FC = () => {
     };
   }, []);
 
+  // Determine metadata extraction method based on file type
+  const determineExtractionMethod = useCallback((file: File) => {
+    const fileType = file.type.toLowerCase();
+    
+    if (fileType.includes('jpeg') || fileType.includes('jpg')) {
+      return 'jpeg';
+    } else if (fileType.includes('tiff')) {
+      return 'tiff';
+    } else {
+      return 'basic';
+    }
+  }, []);
+
+  // Extract metadata based on file type
+  const extractMetadataByType = useCallback((
+    arrayBuffer: ArrayBuffer, 
+    dataView: DataView, 
+    file: File, 
+    extractionMethod: string
+  ): Pick<ImageMetadata, 'exif' | 'iptc' | 'xmp'> => {
+    const result = { exif: {}, iptc: {}, xmp: {} };
+    
+    switch (extractionMethod) {
+      case 'jpeg':
+        result.exif = extractExifData(dataView);
+        result.iptc = extractIptcData(dataView);
+        result.xmp = extractXmpData(arrayBuffer);
+        break;
+      case 'tiff':
+        result.exif = extractTiffExifData(dataView);
+        break;
+      default:
+        result.exif = extractBasicImageInfo(file);
+        break;
+    }
+    
+    return result;
+  }, [extractIptcData, extractXmpData, extractTiffExifData, extractBasicImageInfo]);
+
   // Main metadata extraction function - simplified to reduce complexity
   const extractMetadata = useCallback(async (file: File): Promise<ImageMetadata> => {
     return new Promise((resolve, reject) => {
@@ -565,27 +684,21 @@ const ImageMetadataExtractor: React.FC = () => {
           const arrayBuffer = e.target?.result as ArrayBuffer;
           const dataView = new DataView(arrayBuffer);
           
-          const metadata: ImageMetadata = {
+          const baseMetadata = {
             filename: file.name,
             fileSize: file.size,
             mimeType: file.type,
-            exif: {},
-            iptc: {},
-            xmp: {},
             processedAt: new Date(),
             id: generateUniqueId()
           };
 
-          // Extract metadata based on file type
-          if (file.type.toLowerCase().includes('jpeg') || file.type.toLowerCase().includes('jpg')) {
-            metadata.exif = extractExifData(dataView);
-            metadata.iptc = extractIptcData(dataView);
-            metadata.xmp = extractXmpData(arrayBuffer);
-          } else if (file.type.toLowerCase().includes('tiff')) {
-            metadata.exif = extractTiffExifData(dataView);
-          } else {
-            metadata.exif = extractBasicImageInfo(file);
-          }
+          const extractionMethod = determineExtractionMethod(file);
+          const extractedData = extractMetadataByType(arrayBuffer, dataView, file, extractionMethod);
+          
+          const metadata: ImageMetadata = {
+            ...baseMetadata,
+            ...extractedData
+          };
 
           resolve(metadata);
           
@@ -597,25 +710,28 @@ const ImageMetadataExtractor: React.FC = () => {
       reader.onerror = () => reject(new Error(`Failed to read file: ${file.name}`));
       reader.readAsArrayBuffer(file);
     });
-  }, [extractIptcData, extractXmpData, extractTiffExifData, extractBasicImageInfo]);
+  }, [determineExtractionMethod, extractMetadataByType]);
+
+  // Process individual file
+  const processFile = useCallback(async (file: File, index: number, total: number) => {
+    setStatus(`Processing ${file.name} (${index + 1}/${total})...`);
+    const metadata = await extractMetadata(file);
+    setExtractedMetadata(prev => [...prev, metadata]);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    return metadata;
+  }, [extractMetadata]);
 
   // File handling - simplified to reduce complexity
   const processFiles = useCallback(async (validFiles: File[]) => {
     const newMetadata: ImageMetadata[] = [];
     
     for (let i = 0; i < validFiles.length; i++) {
-      const file = validFiles[i];
-      setStatus(`Processing ${file.name} (${i + 1}/${validFiles.length})...`);
-      
-      const metadata = await extractMetadata(file);
+      const metadata = await processFile(validFiles[i], i, validFiles.length);
       newMetadata.push(metadata);
-      
-      setExtractedMetadata(prev => [...prev, metadata]);
-      await new Promise(resolve => setTimeout(resolve, 10));
     }
     
     return newMetadata;
-  }, [extractMetadata]);
+  }, [processFile]);
 
   const handleFiles = useCallback(async (files: FileList | File[]) => {
     const fileArray = Array.from(files);
@@ -634,7 +750,8 @@ const ImageMetadataExtractor: React.FC = () => {
 
     try {
       await processFiles(validFiles);
-      setStatus(`✅ Successfully processed ${validFiles.length} image(s). Metadata extracted and ready for export.`);
+      const successMessage = `Successfully processed ${validFiles.length} image(s). Metadata extracted and ready for export.`;
+      setStatus(`✅ ${successMessage}`);
     } catch (error) {
       console.error('Error processing files:', error);
       setStatus(`❌ Error processing files: ${(error as Error).message}`);
@@ -643,17 +760,10 @@ const ImageMetadataExtractor: React.FC = () => {
     }
   }, [processFiles, supportedMimeTypes]);
 
-  // Event handlers with keyboard support for accessibility
+  // Event handlers
   const handleUploadClick = useCallback(() => {
     fileInputRef.current?.click();
   }, []);
-
-  const handleUploadKeyDown = useCallback((e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' || e.key === ' ') {
-      e.preventDefault();
-      handleUploadClick();
-    }
-  }, [handleUploadClick]);
 
   const handleFileInputChange = useCallback((e: ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
@@ -661,7 +771,7 @@ const ImageMetadataExtractor: React.FC = () => {
     }
   }, [handleFiles]);
 
-  const handleDragOver = useCallback((e: DragEvent<HTMLDivElement>) => {
+  const handleDragOver = useCallback((e: DragEvent<HTMLButtonElement>) => {
     e.preventDefault();
     setIsDragOver(true);
   }, []);
@@ -670,7 +780,7 @@ const ImageMetadataExtractor: React.FC = () => {
     setIsDragOver(false);
   }, []);
 
-  const handleDrop = useCallback((e: DragEvent<HTMLDivElement>) => {
+  const handleDrop = useCallback((e: DragEvent<HTMLButtonElement>) => {
     e.preventDefault();
     setIsDragOver(false);
     if (e.dataTransfer.files) {
@@ -696,7 +806,8 @@ const ImageMetadataExtractor: React.FC = () => {
       type: 'application/json'
     });
     
-    downloadFile(blob, `image-metadata-${Date.now()}.json`);
+    const filename = `image-metadata-${Date.now()}.json`;
+    downloadFile(blob, filename);
     setStatus(`✅ JSON export completed for ${extractedMetadata.length} image(s)`);
   }, [extractedMetadata, downloadFile]);
 
@@ -706,34 +817,16 @@ const ImageMetadataExtractor: React.FC = () => {
       return;
     }
 
-    const headers = [
-      'filename', 'fileSize', 'mimeType', 'processedAt',
-      'exif_make', 'exif_model', 'exif_dateTime', 'exif_orientation',
-      'iptc_detected', 'xmp_detected', 'xmp_title', 'xmp_creator'
-    ];
-
-    const rows = extractedMetadata.map(metadata => [
-      escapeCsvValue(metadata.filename),
-      metadata.fileSize,
-      escapeCsvValue(metadata.mimeType),
-      metadata.processedAt.toISOString(),
-      escapeCsvValue(metadata.exif.Make || ''),
-      escapeCsvValue(metadata.exif.Model || ''),
-      escapeCsvValue(metadata.exif.DateTime || ''),
-      metadata.exif.Orientation || '',
-      metadata.iptc.detected || false,
-      metadata.xmp.detected || false,
-      escapeCsvValue(metadata.xmp.title || ''),
-      escapeCsvValue(metadata.xmp.creator || '')
-    ]);
+    const rows = extractedMetadata.map(metadata => createCsvRow(metadata, escapeCsvValue));
 
     const csvContent = [
-      headers.join(','),
+      CSV_HEADERS.join(','),
       ...rows.map(row => row.join(','))
     ].join('\n');
 
     const blob = new Blob([csvContent], { type: 'text/csv' });
-    downloadFile(blob, `image-metadata-${Date.now()}.csv`);
+    const filename = `image-metadata-${Date.now()}.csv`;
+    downloadFile(blob, filename);
     setStatus(`✅ CSV export completed for ${extractedMetadata.length} image(s)`);
   }, [extractedMetadata, escapeCsvValue, downloadFile]);
 
@@ -745,68 +838,81 @@ const ImageMetadataExtractor: React.FC = () => {
     setStatus('All data cleared. Ready to process new images.');
   }, []);
 
-  // Test functionality
+  // Test functionality - simplified to reduce complexity
+  const executeTest = useCallback((
+    test: any, 
+    formatFileSize: (bytes: number) => string,
+    escapeCsvValue: (value: any) => string,
+    supportedMimeTypes: Set<string>
+  ): TestResult => {
+    try {
+      let result = false;
+      
+      if (test.name === 'File size formatting') {
+        result = test.test(formatFileSize);
+      } else if (test.name === 'CSV escaping') {
+        result = test.test(escapeCsvValue);
+      } else if (test.name === 'Supported MIME types') {
+        result = test.test(supportedMimeTypes);
+      } else {
+        result = test.test();
+      }
+      
+      return { name: test.name, passed: result, error: null };
+    } catch (error) {
+      return { 
+        name: test.name, 
+        passed: false, 
+        error: (error as Error).message 
+      };
+    }
+  }, []);
+
   const runTests = useCallback(async () => {
     const originalStatus = status;
     setStatus('🧪 Running tests...');
     setIsProcessing(true);
     
     const testResults: TestResult[] = [];
-    const tests = [
-      {
-        name: 'File size formatting',
-        test: () => formatFileSize(1024) === '1 KB'
-      },
-      {
-        name: 'CSV escaping',
-        test: () => escapeCsvValue('test,value') === '"test,value"'
-      },
-      {
-        name: 'Supported MIME types',
-        test: () => supportedMimeTypes.has('image/jpeg')
-      },
-      {
-        name: 'Type sizes',
-        test: () => getTypeSize(3) === 2
-      },
+    
+    // Add array initialization test
+    const allTests = [
+      ...TEST_DEFINITIONS,
       {
         name: 'Metadata array initialization',
         test: () => Array.isArray(extractedMetadata)
       }
     ];
 
-    for (const test of tests) {
-      try {
-        const result = test.test();
-        testResults.push({ name: test.name, passed: result, error: null });
-      } catch (error) {
-        testResults.push({ 
-          name: test.name, 
-          passed: false, 
-          error: (error as Error).message 
-        });
-      }
+    for (const test of allTests) {
+      const result = executeTest(test, formatFileSize, escapeCsvValue, supportedMimeTypes);
+      testResults.push(result);
     }
 
     const passed = testResults.filter(r => r.passed).length;
     const total = testResults.length;
     
-    const resultText = testResults.map(r => 
-      `${r.passed ? '✅' : '❌'} ${r.name}${r.error ? ` (${r.error})` : ''}`
-    ).join('\n');
+    const resultText = testResults.map(r => {
+      const status = r.passed ? '✅' : '❌';
+      const errorInfo = r.error ? ` (${r.error})` : '';
+      return `${status} ${r.name}${errorInfo}`;
+    }).join('\n');
     
-    alert(`🧪 Test Results: ${passed}/${total} passed\n\n${resultText}`);
+    const testSummary = `🧪 Test Results: ${passed}/${total} passed`;
+    const fullMessage = `${testSummary}\n\n${resultText}`;
+    alert(fullMessage);
     
     setStatus(originalStatus);
     setIsProcessing(false);
-  }, [status, formatFileSize, escapeCsvValue, extractedMetadata, supportedMimeTypes]);
+  }, [status, formatFileSize, escapeCsvValue, extractedMetadata, supportedMimeTypes, executeTest]);
 
-  // Render metadata section - simplified template literals
+  // Render metadata section - fixed nested template literals
   const renderMetadataSection = useCallback((title: string, data: Record<string, any>) => {
     const icon = METADATA_ICONS[title] || '📄';
     
     if (!data || Object.keys(data).length === 0) {
-      const noDataMessage = `No ${title.toLowerCase()} found`;
+      const titleLowercase = title.toLowerCase();
+      const noDataMessage = `No ${titleLowercase} found`;
       
       return (
         <div style={styles.metadataSection} key={title}>
@@ -836,18 +942,38 @@ const ImageMetadataExtractor: React.FC = () => {
 
   // File info component to avoid nested template literals
   const renderFileInfo = useCallback((metadata: ImageMetadata) => {
-    const fileInfo = [
-      `File Size: ${formatFileSize(metadata.fileSize)}`,
-      `MIME Type: ${metadata.mimeType}`,
-      `Processed: ${metadata.processedAt.toLocaleString()}`,
-      `Browser: ${navigator.userAgent.split(' ')[0]}`
-    ].join('\n');
+    const fileSizeText = `File Size: ${formatFileSize(metadata.fileSize)}`;
+    const mimeTypeText = `MIME Type: ${metadata.mimeType}`;
+    const processedText = `Processed: ${metadata.processedAt.toLocaleString()}`;
+    const browserText = `Browser: ${navigator.userAgent.split(' ')[0]}`;
+    
+    const fileInfo = [fileSizeText, mimeTypeText, processedText, browserText].join('\n');
 
     return (
       <div style={styles.metadataSection}>
         <h4 style={styles.metadataSectionTitle}>📊 File Information</h4>
         <div style={styles.metadataContent}>
           {fileInfo}
+        </div>
+      </div>
+    );
+  }, [formatFileSize]);
+
+  // Render metadata card header - fixed nested template literals
+  const renderMetadataCardHeader = useCallback((metadata: ImageMetadata) => {
+    const fileSizeFormatted = formatFileSize(metadata.fileSize);
+    const headerInfo = `${fileSizeFormatted} • ${metadata.mimeType}`;
+    
+    return (
+      <div style={styles.metadataHeader}>
+        <span>📄 {metadata.filename}</span>
+        <div style={{ 
+          fontWeight: 'normal', 
+          fontSize: '12px', 
+          color: '#6c757d', 
+          marginTop: '4px' 
+        }}>
+          {headerInfo}
         </div>
       </div>
     );
@@ -865,44 +991,41 @@ const ImageMetadataExtractor: React.FC = () => {
         </div>
         
         <div style={{...styles.content, ...(isProcessing ? styles.processing : {})}}>
-          <div 
-            style={{
-              ...styles.uploadZone,
-              ...(isDragOver ? styles.uploadZoneHover : {})
-            }}
-            onDragOver={handleDragOver}
-            onDragLeave={handleDragLeave}
-            onDrop={handleDrop}
-            role="button"
-            tabIndex={0}
-            onKeyDown={handleUploadKeyDown}
-            aria-label="Upload zone for image files"
-          >
-            <div style={styles.uploadIcon}>📁</div>
-            <div>
-              <p style={{ fontSize: '1.2rem', marginBottom: '10px', fontWeight: 600 }}>
-                Drop images here or
+          <div style={styles.uploadZoneContainer}>
+            {/* Fixed: Use actual button instead of div with role="button" */}
+            <button
+              style={{
+                ...styles.uploadZone,
+                ...(isDragOver ? styles.uploadZoneHover : {})
+              }}
+              onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
+              onDrop={handleDrop}
+              onClick={handleUploadClick}
+              aria-label="Upload zone for image files - click to select files or drag and drop"
+            >
+              <div style={styles.uploadIcon}>📁</div>
+              <div>
+                <p style={{ fontSize: '1.2rem', marginBottom: '10px', fontWeight: 600 }}>
+                  Drop images here or click to choose
+                </p>
+                <span style={styles.uploadButton}>
+                  Choose Images
+                </span>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  style={styles.fileInput}
+                  multiple
+                  accept="image/jpeg,image/jpg,image/png,image/tiff,image/tif"
+                  onChange={handleFileInputChange}
+                  aria-label="File input for images"
+                />
+              </div>
+              <p style={{ marginTop: '20px', color: '#6c757d', fontSize: '0.9rem' }}>
+                Supports JPEG, PNG, TIFF • Multiple files • No server upload • Privacy protected
               </p>
-              <button 
-                style={styles.uploadButton} 
-                onClick={handleUploadClick}
-                aria-label="Choose image files to upload"
-              >
-                Choose Images
-              </button>
-              <input
-                ref={fileInputRef}
-                type="file"
-                style={styles.fileInput}
-                multiple
-                accept="image/jpeg,image/jpg,image/png,image/tiff,image/tif"
-                onChange={handleFileInputChange}
-                aria-label="File input for images"
-              />
-            </div>
-            <p style={{ marginTop: '20px', color: '#6c757d', fontSize: '0.9rem' }}>
-              Supports JPEG, PNG, TIFF • Multiple files • No server upload • Privacy protected
-            </p>
+            </button>
           </div>
           
           <div style={styles.controls}>
@@ -960,18 +1083,7 @@ const ImageMetadataExtractor: React.FC = () => {
             ) : (
               extractedMetadata.map((metadata) => (
                 <div key={metadata.id} style={styles.metadataCard}>
-                  <div style={styles.metadataHeader}>
-                    <span>📄 {metadata.filename}</span>
-                    <div style={{ 
-                      fontWeight: 'normal', 
-                      fontSize: '12px', 
-                      color: '#6c757d', 
-                      marginTop: '4px' 
-                    }}>
-                      {formatFileSize(metadata.fileSize)} • {metadata.mimeType}
-                    </div>
-                  </div>
-                  
+                  {renderMetadataCardHeader(metadata)}
                   {renderMetadataSection('EXIF Data', metadata.exif)}
                   {renderMetadataSection('IPTC Data', metadata.iptc)}
                   {renderMetadataSection('XMP Data', metadata.xmp)}
