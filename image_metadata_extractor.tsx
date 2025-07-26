@@ -1,4 +1,4 @@
-'use client'
+'use client';
 import React, { useState, useRef, useCallback, DragEvent, ChangeEvent } from 'react';
 
 // TypeScript interfaces
@@ -79,7 +79,7 @@ const TEST_DEFINITIONS = [
   }
 ];
 
-// Styles object with fixed duplicate padding issue
+// Styles object
 const styles = {
   container: {
     margin: 0,
@@ -292,9 +292,52 @@ const styles = {
 // Helper functions to reduce cognitive complexity
 const getTypeSize = (type: number): number => TYPE_SIZES[type] || 1;
 
-// Fixed: Replace deprecated substr() with slice()
 const generateUniqueId = (): string => `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
 
+// NEW: Helper functions for getTagValue to reduce cognitive complexity
+const calculateActualOffset = (
+  dataView: DataView,
+  valueOffset: number,
+  type: number,
+  count: number,
+  tiffOffset: number,
+  isBigEndian: boolean
+): number => {
+  if (getTypeSize(type) * count > 4) {
+    return tiffOffset + (isBigEndian ? 
+      dataView.getUint32(valueOffset) : 
+      dataView.getUint32(valueOffset, true));
+  }
+  return valueOffset;
+};
+
+const readUint16Value = (dataView: DataView, offset: number, isBigEndian: boolean): number => {
+  return isBigEndian ? 
+    dataView.getUint16(offset) : 
+    dataView.getUint16(offset, true);
+};
+
+const readUint32Value = (dataView: DataView, offset: number, isBigEndian: boolean): number => {
+  return isBigEndian ? 
+    dataView.getUint32(offset) : 
+    dataView.getUint32(offset, true);
+};
+
+const readAsciiString = (dataView: DataView, offset: number, count: number): string => {
+  let str = '';
+  for (let i = 0; i < Math.min(count - 1, 100); i++) {
+    str += String.fromCharCode(dataView.getUint8(offset + i));
+  }
+  return str;
+};
+
+const readRationalValue = (dataView: DataView, offset: number, isBigEndian: boolean): number => {
+  const numerator = readUint32Value(dataView, offset, isBigEndian);
+  const denominator = readUint32Value(dataView, offset + 4, isBigEndian);
+  return denominator !== 0 ? numerator / denominator : 0;
+};
+
+// UPDATED: Refactored getTagValue function with reduced cognitive complexity
 const getTagValue = (
   dataView: DataView, 
   valueOffset: number, 
@@ -303,43 +346,23 @@ const getTagValue = (
   tiffOffset: number, 
   isBigEndian: boolean
 ): any => {
-  let actualOffset = valueOffset;
-  
-  if (getTypeSize(type) * count > 4) {
-    actualOffset = tiffOffset + (isBigEndian ? 
-      dataView.getUint32(valueOffset) : 
-      dataView.getUint32(valueOffset, true));
-  }
+  const actualOffset = calculateActualOffset(dataView, valueOffset, type, count, tiffOffset, isBigEndian);
 
   switch (type) {
     case 1: {
       return dataView.getUint8(actualOffset);
     }
     case 2: {
-      let str = '';
-      for (let i = 0; i < Math.min(count - 1, 100); i++) {
-        str += String.fromCharCode(dataView.getUint8(actualOffset + i));
-      }
-      return str;
+      return readAsciiString(dataView, actualOffset, count);
     }
     case 3: {
-      return isBigEndian ? 
-        dataView.getUint16(actualOffset) : 
-        dataView.getUint16(actualOffset, true);
+      return readUint16Value(dataView, actualOffset, isBigEndian);
     }
     case 4: {
-      return isBigEndian ? 
-        dataView.getUint32(actualOffset) : 
-        dataView.getUint32(actualOffset, true);
+      return readUint32Value(dataView, actualOffset, isBigEndian);
     }
     case 5: {
-      const numerator = isBigEndian ? 
-        dataView.getUint32(actualOffset) : 
-        dataView.getUint32(actualOffset, true);
-      const denominator = isBigEndian ? 
-        dataView.getUint32(actualOffset + 4) : 
-        dataView.getUint32(actualOffset + 4, true);
-      return denominator !== 0 ? numerator / denominator : 0;
+      return readRationalValue(dataView, actualOffset, isBigEndian);
     }
     default: {
       return null;
@@ -674,7 +697,7 @@ const ImageMetadataExtractor: React.FC = () => {
     return result;
   }, [extractIptcData, extractXmpData, extractTiffExifData, extractBasicImageInfo]);
 
-  // Main metadata extraction function - simplified to reduce complexity
+  // Main metadata extraction function
   const extractMetadata = useCallback(async (file: File): Promise<ImageMetadata> => {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -721,7 +744,7 @@ const ImageMetadataExtractor: React.FC = () => {
     return metadata;
   }, [extractMetadata]);
 
-  // File handling - simplified to reduce complexity
+  // File handling
   const processFiles = useCallback(async (validFiles: File[]) => {
     const newMetadata: ImageMetadata[] = [];
     
@@ -838,7 +861,7 @@ const ImageMetadataExtractor: React.FC = () => {
     setStatus('All data cleared. Ready to process new images.');
   }, []);
 
-  // Test functionality - simplified to reduce complexity
+  // Test functionality
   const executeTest = useCallback((
     test: any, 
     formatFileSize: (bytes: number) => string,
@@ -875,7 +898,6 @@ const ImageMetadataExtractor: React.FC = () => {
     
     const testResults: TestResult[] = [];
     
-    // Add array initialization test
     const allTests = [
       ...TEST_DEFINITIONS,
       {
@@ -906,7 +928,7 @@ const ImageMetadataExtractor: React.FC = () => {
     setIsProcessing(false);
   }, [status, formatFileSize, escapeCsvValue, extractedMetadata, supportedMimeTypes, executeTest]);
 
-  // Render metadata section - fixed nested template literals
+  // Render metadata section
   const renderMetadataSection = useCallback((title: string, data: Record<string, any>) => {
     const icon = METADATA_ICONS[title] || '📄';
     
@@ -940,7 +962,7 @@ const ImageMetadataExtractor: React.FC = () => {
     );
   }, []);
 
-  // File info component to avoid nested template literals
+  // File info component
   const renderFileInfo = useCallback((metadata: ImageMetadata) => {
     const fileSizeText = `File Size: ${formatFileSize(metadata.fileSize)}`;
     const mimeTypeText = `MIME Type: ${metadata.mimeType}`;
@@ -959,7 +981,7 @@ const ImageMetadataExtractor: React.FC = () => {
     );
   }, [formatFileSize]);
 
-  // Render metadata card header - fixed nested template literals
+  // Render metadata card header
   const renderMetadataCardHeader = useCallback((metadata: ImageMetadata) => {
     const fileSizeFormatted = formatFileSize(metadata.fileSize);
     const headerInfo = `${fileSizeFormatted} • ${metadata.mimeType}`;
@@ -992,7 +1014,6 @@ const ImageMetadataExtractor: React.FC = () => {
         
         <div style={{...styles.content, ...(isProcessing ? styles.processing : {})}}>
           <div style={styles.uploadZoneContainer}>
-            {/* Fixed: Use actual button instead of div with role="button" */}
             <button
               style={{
                 ...styles.uploadZone,
