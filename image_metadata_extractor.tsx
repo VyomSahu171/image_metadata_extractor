@@ -10,6 +10,7 @@ interface ImageMetadata {
   iptc: Record<string, any>;
   xmp: Record<string, any>;
   processedAt: Date;
+  id: string; // Added unique identifier for React keys
 }
 
 interface TestResult {
@@ -18,16 +19,48 @@ interface TestResult {
   error: string | null;
 }
 
-// Styles object for CSS-in-JS
+interface ExifTag {
+  [key: number]: string;
+}
+
+// Constants moved outside to reduce complexity
+const EXIF_TAGS: ExifTag = {
+  0x010F: 'Make',
+  0x0110: 'Model',
+  0x0112: 'Orientation',
+  0x011A: 'XResolution',
+  0x011B: 'YResolution',
+  0x0128: 'ResolutionUnit',
+  0x0132: 'DateTime',
+  0x013B: 'Artist',
+  0x0213: 'YCbCrPositioning',
+  0x8769: 'ExifIFDPointer',
+  0x8825: 'GPSIFDPointer'
+};
+
+const TYPE_SIZES: Record<number, number> = {
+  1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8
+};
+
+const METADATA_ICONS: Record<string, string> = {
+  'EXIF Data': '📷',
+  'IPTC Data': '📝',
+  'XMP Data': '🏷️'
+};
+
+// RegExp objects for better performance and SonarQube compliance
+const XMP_TITLE_REGEX = /<dc:title[^>]*>([^<]+)<\/dc:title>/i;
+const XMP_CREATOR_REGEX = /<dc:creator[^>]*>([^<]+)<\/dc:creator>/i;
+
+// Styles object with fixed duplicate padding issue
 const styles = {
   container: {
     margin: 0,
-    padding: 0,
     boxSizing: 'border-box' as const,
     fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
     background: '#f8f9fa',
     minHeight: '100vh',
-    padding: '20px',
+    padding: '20px', // Single padding declaration
   },
   metadataExtractor: {
     maxWidth: '1200px',
@@ -152,7 +185,6 @@ const styles = {
   statusProcessing: {
     background: 'linear-gradient(135deg, #fff3cd, #ffeaa7)',
     borderLeftColor: '#ffc107',
-    animation: 'pulse 2s infinite',
   },
   metadataGrid: {
     display: 'grid',
@@ -225,6 +257,159 @@ const styles = {
   },
 };
 
+// Helper functions to reduce cognitive complexity
+const getTypeSize = (type: number): number => TYPE_SIZES[type] || 1;
+
+const generateUniqueId = (): string => `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+const getTagValue = (
+  dataView: DataView, 
+  valueOffset: number, 
+  type: number, 
+  count: number, 
+  tiffOffset: number, 
+  isBigEndian: boolean
+): any => {
+  let actualOffset = valueOffset;
+  
+  if (getTypeSize(type) * count > 4) {
+    actualOffset = tiffOffset + (isBigEndian ? 
+      dataView.getUint32(valueOffset) : 
+      dataView.getUint32(valueOffset, true));
+  }
+
+  switch (type) {
+    case 1: {
+      return dataView.getUint8(actualOffset);
+    }
+    case 2: {
+      let str = '';
+      for (let i = 0; i < Math.min(count - 1, 100); i++) {
+        str += String.fromCharCode(dataView.getUint8(actualOffset + i));
+      }
+      return str;
+    }
+    case 3: {
+      return isBigEndian ? 
+        dataView.getUint16(actualOffset) : 
+        dataView.getUint16(actualOffset, true);
+    }
+    case 4: {
+      return isBigEndian ? 
+        dataView.getUint32(actualOffset) : 
+        dataView.getUint32(actualOffset, true);
+    }
+    case 5: {
+      const numerator = isBigEndian ? 
+        dataView.getUint32(actualOffset) : 
+        dataView.getUint32(actualOffset, true);
+      const denominator = isBigEndian ? 
+        dataView.getUint32(actualOffset + 4) : 
+        dataView.getUint32(actualOffset + 4, true);
+      return denominator !== 0 ? numerator / denominator : 0;
+    }
+    default: {
+      return null;
+    }
+  }
+};
+
+const parseIfd = (
+  dataView: DataView, 
+  ifdOffset: number, 
+  tiffOffset: number, 
+  isBigEndian: boolean, 
+  exifData: Record<string, any>
+) => {
+  const tagCount = isBigEndian ? 
+    dataView.getUint16(ifdOffset) : 
+    dataView.getUint16(ifdOffset, true);
+
+  for (let i = 0; i < Math.min(tagCount, 50); i++) {
+    const tagOffset = ifdOffset + 2 + (i * 12);
+    const tag = isBigEndian ? 
+      dataView.getUint16(tagOffset) : 
+      dataView.getUint16(tagOffset, true);
+    
+    const type = isBigEndian ? 
+      dataView.getUint16(tagOffset + 2) : 
+      dataView.getUint16(tagOffset + 2, true);
+      
+    const count = isBigEndian ? 
+      dataView.getUint32(tagOffset + 4) : 
+      dataView.getUint32(tagOffset + 4, true);
+
+    if (EXIF_TAGS[tag]) {
+      try {
+        const value = getTagValue(dataView, tagOffset + 8, type, count, tiffOffset, isBigEndian);
+        exifData[EXIF_TAGS[tag]] = value;
+      } catch (error) {
+        console.warn(`Error reading tag ${EXIF_TAGS[tag]}:`, error);
+      }
+    }
+  }
+};
+
+const extractExifData = (dataView: DataView): Record<string, any> => {
+  const exifData: Record<string, any> = {};
+  
+  try {
+    for (let i = 0; i < dataView.byteLength - 1; i++) {
+      if (dataView.getUint8(i) === 0xFF && dataView.getUint8(i + 1) === 0xE1) {
+        const exifHeaderOffset = i + 4; // Removed unused segmentLength assignment
+        
+        if (dataView.getUint32(exifHeaderOffset) === 0x45786966 && 
+            dataView.getUint16(exifHeaderOffset + 4) === 0x0000) {
+          
+          const tiffOffset = exifHeaderOffset + 6;
+          const isBigEndian = dataView.getUint16(tiffOffset) === 0x4D4D;
+          
+          exifData.byteOrder = isBigEndian ? 'Big Endian' : 'Little Endian';
+          
+          const ifd0Offset = tiffOffset + (isBigEndian ? 
+            dataView.getUint32(tiffOffset + 4) : 
+            dataView.getUint32(tiffOffset + 4, true));
+          
+          parseIfd(dataView, ifd0Offset, tiffOffset, isBigEndian, exifData);
+        }
+        break;
+      }
+    }
+  } catch (error) {
+    console.warn('Error extracting EXIF data:', error);
+    exifData.error = 'Failed to parse EXIF data';
+  }
+
+  return exifData;
+};
+
+const findIptcMarkers = (dataView: DataView): boolean => {
+  for (let i = 0; i < Math.min(dataView.byteLength - 1, 32768); i++) {
+    if ((dataView.getUint8(i) === 0xFF && dataView.getUint8(i + 1) === 0xED) ||
+        (dataView.getUint8(i) === 0xFF && dataView.getUint8(i + 1) === 0xE2)) {
+      return true;
+    }
+  }
+  return false;
+};
+
+const extractXmpMetadata = (xmpContent: string): Record<string, any> => {
+  const xmpData: Record<string, any> = {};
+  
+  // Use RegExp.exec() instead of string.match()
+  const titleMatch = XMP_TITLE_REGEX.exec(xmpContent);
+  if (titleMatch) {
+    xmpData.title = titleMatch[1];
+  }
+  
+  const creatorMatch = XMP_CREATOR_REGEX.exec(xmpContent);
+  if (creatorMatch) {
+    xmpData.creator = creatorMatch[1];
+  }
+  
+  return xmpData;
+};
+
 const ImageMetadataExtractor: React.FC = () => {
   // State management
   const [extractedMetadata, setExtractedMetadata] = useState<ImageMetadata[]>([]);
@@ -270,159 +455,16 @@ const ImageMetadataExtractor: React.FC = () => {
     URL.revokeObjectURL(url);
   }, []);
 
-  // EXIF extraction functions
-  const getTypeSize = useCallback((type: number): number => {
-    const sizes: Record<number, number> = {
-      1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8
-    };
-    return sizes[type] || 1;
-  }, []);
-
-  const getTagValue = useCallback((
-    dataView: DataView, 
-    valueOffset: number, 
-    type: number, 
-    count: number, 
-    tiffOffset: number, 
-    isBigEndian: boolean
-  ): any => {
-    let actualOffset = valueOffset;
-    
-    if (getTypeSize(type) * count > 4) {
-      actualOffset = tiffOffset + (isBigEndian ? 
-        dataView.getUint32(valueOffset) : 
-        dataView.getUint32(valueOffset, true));
-    }
-
-    switch (type) {
-      case 1: // BYTE
-        return dataView.getUint8(actualOffset);
-      case 2: // ASCII
-        let str = '';
-        for (let i = 0; i < Math.min(count - 1, 100); i++) {
-          str += String.fromCharCode(dataView.getUint8(actualOffset + i));
-        }
-        return str;
-      case 3: // SHORT
-        return isBigEndian ? 
-          dataView.getUint16(actualOffset) : 
-          dataView.getUint16(actualOffset, true);
-      case 4: // LONG
-        return isBigEndian ? 
-          dataView.getUint32(actualOffset) : 
-          dataView.getUint32(actualOffset, true);
-      case 5: // RATIONAL
-        const numerator = isBigEndian ? 
-          dataView.getUint32(actualOffset) : 
-          dataView.getUint32(actualOffset, true);
-        const denominator = isBigEndian ? 
-          dataView.getUint32(actualOffset + 4) : 
-          dataView.getUint32(actualOffset + 4, true);
-        return denominator !== 0 ? numerator / denominator : 0;
-      default:
-        return null;
-    }
-  }, [getTypeSize]);
-
-  const parseIfd = useCallback((
-    dataView: DataView, 
-    ifdOffset: number, 
-    tiffOffset: number, 
-    isBigEndian: boolean, 
-    exifData: Record<string, any>
-  ) => {
-    const tagCount = isBigEndian ? 
-      dataView.getUint16(ifdOffset) : 
-      dataView.getUint16(ifdOffset, true);
-
-    const exifTags: Record<number, string> = {
-      0x010F: 'Make',
-      0x0110: 'Model',
-      0x0112: 'Orientation',
-      0x011A: 'XResolution',
-      0x011B: 'YResolution',
-      0x0128: 'ResolutionUnit',
-      0x0132: 'DateTime',
-      0x013B: 'Artist',
-      0x0213: 'YCbCrPositioning',
-      0x8769: 'ExifIFDPointer',
-      0x8825: 'GPSIFDPointer'
-    };
-
-    for (let i = 0; i < Math.min(tagCount, 50); i++) {
-      const tagOffset = ifdOffset + 2 + (i * 12);
-      const tag = isBigEndian ? 
-        dataView.getUint16(tagOffset) : 
-        dataView.getUint16(tagOffset, true);
-      
-      const type = isBigEndian ? 
-        dataView.getUint16(tagOffset + 2) : 
-        dataView.getUint16(tagOffset + 2, true);
-        
-      const count = isBigEndian ? 
-        dataView.getUint32(tagOffset + 4) : 
-        dataView.getUint32(tagOffset + 4, true);
-
-      if (exifTags[tag]) {
-        try {
-          const value = getTagValue(dataView, tagOffset + 8, type, count, tiffOffset, isBigEndian);
-          exifData[exifTags[tag]] = value;
-        } catch (error) {
-          console.warn(`Error reading tag ${exifTags[tag]}:`, error);
-        }
-      }
-    }
-  }, [getTagValue]);
-
-  const extractExifData = useCallback((dataView: DataView): Record<string, any> => {
-    const exifData: Record<string, any> = {};
-    
-    try {
-      for (let i = 0; i < dataView.byteLength - 1; i++) {
-        if (dataView.getUint8(i) === 0xFF && dataView.getUint8(i + 1) === 0xE1) {
-          const segmentLength = dataView.getUint16(i + 2);
-          const exifHeaderOffset = i + 4;
-          
-          if (dataView.getUint32(exifHeaderOffset) === 0x45786966 && 
-              dataView.getUint16(exifHeaderOffset + 4) === 0x0000) {
-            
-            const tiffOffset = exifHeaderOffset + 6;
-            const isBigEndian = dataView.getUint16(tiffOffset) === 0x4D4D;
-            
-            exifData.byteOrder = isBigEndian ? 'Big Endian' : 'Little Endian';
-            
-            const ifd0Offset = tiffOffset + (isBigEndian ? 
-              dataView.getUint32(tiffOffset + 4) : 
-              dataView.getUint32(tiffOffset + 4, true));
-            
-            parseIfd(dataView, ifd0Offset, tiffOffset, isBigEndian, exifData);
-          }
-          break;
-        }
-      }
-    } catch (error) {
-      console.warn('Error extracting EXIF data:', error);
-      exifData.error = 'Failed to parse EXIF data';
-    }
-
-    return exifData;
-  }, [parseIfd]);
-
   const extractIptcData = useCallback((dataView: DataView): Record<string, any> => {
     const iptcData: Record<string, any> = {};
     
     try {
-      for (let i = 0; i < Math.min(dataView.byteLength - 1, 32768); i++) {
-        if ((dataView.getUint8(i) === 0xFF && dataView.getUint8(i + 1) === 0xED) ||
-            (dataView.getUint8(i) === 0xFF && dataView.getUint8(i + 1) === 0xE2)) {
-          
-          iptcData.detected = true;
-          iptcData.note = 'IPTC data detected but requires specialized parser for full extraction';
-          break;
-        }
-      }
+      const hasIptcMarkers = findIptcMarkers(dataView);
       
-      if (!iptcData.detected) {
+      if (hasIptcMarkers) {
+        iptcData.detected = true;
+        iptcData.note = 'IPTC data detected but requires specialized parser for full extraction';
+      } else {
         iptcData.detected = false;
         iptcData.note = 'No IPTC data found';
       }
@@ -454,11 +496,9 @@ const ImageMetadataExtractor: React.FC = () => {
         xmpData.rawXMP = xmpContent.substring(0, 500) + '...';
         xmpData.detected = true;
         
-        const titleMatch = xmpContent.match(/<dc:title[^>]*>([^<]+)<\/dc:title>/i);
-        if (titleMatch) xmpData.title = titleMatch[1];
-        
-        const creatorMatch = xmpContent.match(/<dc:creator[^>]*>([^<]+)<\/dc:creator>/i);
-        if (creatorMatch) xmpData.creator = creatorMatch[1];
+        // Extract metadata using helper function
+        const extractedMetadata = extractXmpMetadata(xmpContent);
+        Object.assign(xmpData, extractedMetadata);
         
       } else {
         xmpData.detected = false;
@@ -504,7 +544,7 @@ const ImageMetadataExtractor: React.FC = () => {
     }
 
     return exifData;
-  }, [parseIfd]);
+  }, []);
 
   const extractBasicImageInfo = useCallback((file: File): Record<string, any> => {
     return {
@@ -515,7 +555,7 @@ const ImageMetadataExtractor: React.FC = () => {
     };
   }, []);
 
-  // Main metadata extraction function
+  // Main metadata extraction function - simplified to reduce complexity
   const extractMetadata = useCallback(async (file: File): Promise<ImageMetadata> => {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -532,9 +572,11 @@ const ImageMetadataExtractor: React.FC = () => {
             exif: {},
             iptc: {},
             xmp: {},
-            processedAt: new Date()
+            processedAt: new Date(),
+            id: generateUniqueId()
           };
 
+          // Extract metadata based on file type
           if (file.type.toLowerCase().includes('jpeg') || file.type.toLowerCase().includes('jpg')) {
             metadata.exif = extractExifData(dataView);
             metadata.iptc = extractIptcData(dataView);
@@ -555,9 +597,26 @@ const ImageMetadataExtractor: React.FC = () => {
       reader.onerror = () => reject(new Error(`Failed to read file: ${file.name}`));
       reader.readAsArrayBuffer(file);
     });
-  }, [extractExifData, extractIptcData, extractXmpData, extractTiffExifData, extractBasicImageInfo]);
+  }, [extractIptcData, extractXmpData, extractTiffExifData, extractBasicImageInfo]);
 
-  // File handling
+  // File handling - simplified to reduce complexity
+  const processFiles = useCallback(async (validFiles: File[]) => {
+    const newMetadata: ImageMetadata[] = [];
+    
+    for (let i = 0; i < validFiles.length; i++) {
+      const file = validFiles[i];
+      setStatus(`Processing ${file.name} (${i + 1}/${validFiles.length})...`);
+      
+      const metadata = await extractMetadata(file);
+      newMetadata.push(metadata);
+      
+      setExtractedMetadata(prev => [...prev, metadata]);
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    
+    return newMetadata;
+  }, [extractMetadata]);
+
   const handleFiles = useCallback(async (files: FileList | File[]) => {
     const fileArray = Array.from(files);
     const validFiles = fileArray.filter(file => 
@@ -574,35 +633,27 @@ const ImageMetadataExtractor: React.FC = () => {
     setIsProcessing(true);
 
     try {
-      const newMetadata: ImageMetadata[] = [];
-      
-      for (let i = 0; i < validFiles.length; i++) {
-        const file = validFiles[i];
-        setStatus(`Processing ${file.name} (${i + 1}/${validFiles.length})...`);
-        
-        const metadata = await extractMetadata(file);
-        newMetadata.push(metadata);
-        
-        // Update state incrementally for better UX
-        setExtractedMetadata(prev => [...prev, metadata]);
-        
-        await new Promise(resolve => setTimeout(resolve, 10));
-      }
-
+      await processFiles(validFiles);
       setStatus(`✅ Successfully processed ${validFiles.length} image(s). Metadata extracted and ready for export.`);
-      
     } catch (error) {
       console.error('Error processing files:', error);
       setStatus(`❌ Error processing files: ${(error as Error).message}`);
     } finally {
       setIsProcessing(false);
     }
-  }, [extractMetadata, supportedMimeTypes]);
+  }, [processFiles, supportedMimeTypes]);
 
-  // Event handlers
+  // Event handlers with keyboard support for accessibility
   const handleUploadClick = useCallback(() => {
     fileInputRef.current?.click();
   }, []);
+
+  const handleUploadKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      handleUploadClick();
+    }
+  }, [handleUploadClick]);
 
   const handleFileInputChange = useCallback((e: ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
@@ -715,7 +766,7 @@ const ImageMetadataExtractor: React.FC = () => {
         test: () => supportedMimeTypes.has('image/jpeg')
       },
       {
-        name: 'EXIF type sizes',
+        name: 'Type sizes',
         test: () => getTypeSize(3) === 2
       },
       {
@@ -748,24 +799,22 @@ const ImageMetadataExtractor: React.FC = () => {
     
     setStatus(originalStatus);
     setIsProcessing(false);
-  }, [status, formatFileSize, escapeCsvValue, getTypeSize, extractedMetadata]);
+  }, [status, formatFileSize, escapeCsvValue, extractedMetadata, supportedMimeTypes]);
 
-  // Render metadata section
+  // Render metadata section - simplified template literals
   const renderMetadataSection = useCallback((title: string, data: Record<string, any>) => {
-    const icons: Record<string, string> = {
-      'EXIF Data': '📷',
-      'IPTC Data': '📝',
-      'XMP Data': '🏷️'
-    };
-
+    const icon = METADATA_ICONS[title] || '📄';
+    
     if (!data || Object.keys(data).length === 0) {
+      const noDataMessage = `No ${title.toLowerCase()} found`;
+      
       return (
         <div style={styles.metadataSection} key={title}>
           <h4 style={styles.metadataSectionTitle}>
-            {icons[title]} {title}
+            {icon} {title}
           </h4>
           <div style={styles.metadataContent}>
-            No {title.toLowerCase()} found
+            {noDataMessage}
           </div>
         </div>
       );
@@ -776,7 +825,7 @@ const ImageMetadataExtractor: React.FC = () => {
     return (
       <div style={styles.metadataSection} key={title}>
         <h4 style={styles.metadataSectionTitle}>
-          {icons[title]} {title}
+          {icon} {title}
         </h4>
         <div style={styles.metadataContent}>
           {formattedData}
@@ -784,6 +833,25 @@ const ImageMetadataExtractor: React.FC = () => {
       </div>
     );
   }, []);
+
+  // File info component to avoid nested template literals
+  const renderFileInfo = useCallback((metadata: ImageMetadata) => {
+    const fileInfo = [
+      `File Size: ${formatFileSize(metadata.fileSize)}`,
+      `MIME Type: ${metadata.mimeType}`,
+      `Processed: ${metadata.processedAt.toLocaleString()}`,
+      `Browser: ${navigator.userAgent.split(' ')[0]}`
+    ].join('\n');
+
+    return (
+      <div style={styles.metadataSection}>
+        <h4 style={styles.metadataSectionTitle}>📊 File Information</h4>
+        <div style={styles.metadataContent}>
+          {fileInfo}
+        </div>
+      </div>
+    );
+  }, [formatFileSize]);
 
   // Main render
   return (
@@ -805,13 +873,21 @@ const ImageMetadataExtractor: React.FC = () => {
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
+            role="button"
+            tabIndex={0}
+            onKeyDown={handleUploadKeyDown}
+            aria-label="Upload zone for image files"
           >
             <div style={styles.uploadIcon}>📁</div>
             <div>
               <p style={{ fontSize: '1.2rem', marginBottom: '10px', fontWeight: 600 }}>
                 Drop images here or
               </p>
-              <button style={styles.uploadButton} onClick={handleUploadClick}>
+              <button 
+                style={styles.uploadButton} 
+                onClick={handleUploadClick}
+                aria-label="Choose image files to upload"
+              >
                 Choose Images
               </button>
               <input
@@ -821,6 +897,7 @@ const ImageMetadataExtractor: React.FC = () => {
                 multiple
                 accept="image/jpeg,image/jpg,image/png,image/tiff,image/tif"
                 onChange={handleFileInputChange}
+                aria-label="File input for images"
               />
             </div>
             <p style={{ marginTop: '20px', color: '#6c757d', fontSize: '0.9rem' }}>
@@ -836,6 +913,7 @@ const ImageMetadataExtractor: React.FC = () => {
               }}
               onClick={exportAsJson}
               disabled={extractedMetadata.length === 0}
+              aria-label="Export metadata as JSON file"
             >
               📄 Export JSON
             </button>
@@ -846,13 +924,22 @@ const ImageMetadataExtractor: React.FC = () => {
               }}
               onClick={exportAsCsv}
               disabled={extractedMetadata.length === 0}
+              aria-label="Export metadata as CSV file"
             >
               📊 Export CSV
             </button>
-            <button style={styles.clearButton} onClick={clearAll}>
+            <button 
+              style={styles.clearButton} 
+              onClick={clearAll}
+              aria-label="Clear all processed metadata"
+            >
               🗑️ Clear All
             </button>
-            <button style={styles.testButton} onClick={runTests}>
+            <button 
+              style={styles.testButton} 
+              onClick={runTests}
+              aria-label="Run application tests"
+            >
               🧪 Run Tests
             </button>
           </div>
@@ -871,10 +958,10 @@ const ImageMetadataExtractor: React.FC = () => {
                 <p>No images processed yet. Upload images to see their metadata.</p>
               </div>
             ) : (
-              extractedMetadata.map((metadata, index) => (
-                <div key={index} style={styles.metadataCard}>
+              extractedMetadata.map((metadata) => (
+                <div key={metadata.id} style={styles.metadataCard}>
                   <div style={styles.metadataHeader}>
-                    📄 {metadata.filename}
+                    <span>📄 {metadata.filename}</span>
                     <div style={{ 
                       fontWeight: 'normal', 
                       fontSize: '12px', 
@@ -888,16 +975,7 @@ const ImageMetadataExtractor: React.FC = () => {
                   {renderMetadataSection('EXIF Data', metadata.exif)}
                   {renderMetadataSection('IPTC Data', metadata.iptc)}
                   {renderMetadataSection('XMP Data', metadata.xmp)}
-                  
-                  <div style={styles.metadataSection}>
-                    <h4 style={styles.metadataSectionTitle}>📊 File Information</h4>
-                    <div style={styles.metadataContent}>
-{`File Size: ${formatFileSize(metadata.fileSize)}
-MIME Type: ${metadata.mimeType}
-Processed: ${metadata.processedAt.toLocaleString()}
-Browser: ${navigator.userAgent.split(' ')[0]}`}
-                    </div>
-                  </div>
+                  {renderFileInfo(metadata)}
                 </div>
               ))
             )}
